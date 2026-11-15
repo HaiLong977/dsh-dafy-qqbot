@@ -486,6 +486,8 @@
   .vidbtn:hover{background:rgba(88,208,255,.2);color:#fff}
   .vidbtn.main{background:linear-gradient(135deg,#1e8fd8,#25c9a8);color:#02121f;border:none;font-weight:600}
   .vidbtn.main:hover{filter:brightness(1.12)}
+  .vidbtn.danger{border-color:rgba(255,143,177,.5);color:#ffb3c9}
+  .vidbtn.danger:hover{background:rgba(255,143,177,.2);color:#fff}
   .vidbtn:disabled{opacity:.4;cursor:not-allowed;filter:none}
   .vidbar .spacer{flex:1}
   .vidsw{display:flex;align-items:center;gap:7px;font-size:12px;color:#9fc4e4;cursor:pointer;user-select:none}
@@ -998,6 +1000,7 @@
       <button class="vidbtn" id="vidFront">显示抖音窗口</button>
       <button class="vidbtn" id="vidHide">隐藏窗口</button>
       <button class="vidbtn" id="vidShot">↻ 刷新画面</button>
+      <button class="vidbtn danger" id="vidQuit" title="彻底关掉后台的抖音窗口，不再自动跳出来">✕ 关掉抖音后台</button>
       <div class="spacer"></div>
       <label class="vidsw"><input type="checkbox" id="vidPub" checked><span>自动发布评论</span></label>
       <select class="uisel" id="vidGap" title="自动刷视频间隔">
@@ -3763,6 +3766,7 @@ const vid={
   front:document.getElementById('vidFront'),
   hide:document.getElementById('vidHide'),
   shot:document.getElementById('vidShot'),
+  quit:document.getElementById('vidQuit'),
   pub:document.getElementById('vidPub'),
   gap:document.getElementById('vidGap'),
   shotBox:document.getElementById('vidShotBox'),
@@ -3920,6 +3924,7 @@ async function vidPoll(){
     else if(j.running) vidPill('浏览器已开 · 未登录','warn');
     else vidPill('服务在线 · 浏览器未打开','');
     vid.login.textContent=j.loggedIn?'✓ 已登录':'登录抖音';
+    if(j.paused){ vidPill('抖音后台已关闭',''); vidLiveStop(); }
     vid.daily.textContent=fmtDaily(j.dailyCount,j.dailyLimit);
     if(j.running && vid.mask.classList.contains('show')) vidLiveStart();
   }catch(e){
@@ -4144,6 +4149,7 @@ async function vidStep(mode){
       if(j.stale) return;   // 服务端已改用更新的下一条请求，旧结果直接作废
       if(!j.ok){
         if(j.needLogin){ vidLog('需要登录抖音：点「登录抖音」完成扫码',true); vidStopAuto(); }
+        else if(j.paused){ vidLog('抖音后台已关闭，点「打开抖音」再开始',true); vidStopAuto(); }
         else vidLog('刷视频失败：'+(j.reason||'未知原因'),true);
         return;
       }
@@ -4274,6 +4280,21 @@ vid.shot.onclick=async()=>{
     if(j.ok&&j.video){ vidShowVideo(j.video); vidLog('画面已刷新'); }
     else vidLog('还没有在播放的视频',true);
   }catch(e){ vidLog('刷新失败：'+e.message,true); }
+};
+vid.quit.onclick=async()=>{
+  vid.quit.disabled=true;
+  vidStopAuto();
+  vidLog('正在关掉抖音后台…');
+  try{
+    const j=await vidApi('/api/close',{});
+    vidLiveStop();
+    vid.live.style.display='none';
+    vid.ph.style.display='';
+    vid.ph.childNodes[0].textContent='抖音后台已关闭';
+    vidLog(j.ok?'抖音后台已关掉，不会再来回跳了（要再看点「登录抖音」重新打开）':'关闭失败：'+(j.reason||'未知原因'), !j.ok);
+    vidPill('抖音后台已关闭','');
+  }catch(e){ vidLog('关闭失败：'+e.message,true); }
+  finally{ vid.quit.disabled=false; }
 };
 vid.pub.onchange=vidSavePrefs;
 vid.gap.onchange=vidSavePrefs;

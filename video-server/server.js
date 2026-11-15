@@ -45,6 +45,8 @@ let feedCount = 0;            // 本次浏览器会话已刷视频数
 const MAX_FEED_PER_BROWSER = 5; // 每刷 5 条主动重开浏览器，清掉抖音页面累积的内存防崩
 let nextRequestSeq = 0;          // 最新“下一条”请求序号
 let nextTask = null;             // 串行操作同一个浏览器，旧请求发现已有更新后尽快退出
+let muteNotify = false;          // 免打扰：关掉抖音的网页通知 / Windows 媒体弹窗
+let paused = false;              // 用户主动关掉抖音后台：关掉浏览器后不再自动拉起
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const log = (...a) => console.log('[video]', ...a);
@@ -69,6 +71,13 @@ async function launch() {
   if (launching) return launching;
   launching = (async () => {
     await mkdir(PROFILE, { recursive: true });
+    muteNotify = !!(await loadState()).muteNotify;
+    const disableFeatures = [
+      'AudioServiceOutOfProcess',
+      'CalculateNativeWinOcclusion',
+      // 免打扰：关掉 Windows 媒体控制弹窗（每换一条视频就弹「抖音-记录美好生活」）
+      ...(muteNotify ? ['MediaSessionService', 'HardwareMediaKeyHandling', 'GlobalMediaControls'] : []),
+    ];
     const opts = {
       headless: false,
       viewport: { width: 1440, height: 900 },
@@ -79,7 +88,7 @@ async function launch() {
         '--window-size=1440,900',
         '--disable-notifications',
         '--autoplay-policy=no-user-gesture-required',
-        '--disable-features=AudioServiceOutOfProcess,CalculateNativeWinOcclusion',
+        `--disable-features=${disableFeatures.join(',')}`,
         '--disable-backgrounding-occluded-windows',
         '--disable-renderer-backgrounding',
         '--disable-background-timer-throttling',
@@ -95,11 +104,23 @@ async function launch() {
       ctx = await chromium.launchPersistentContext(PROFILE, opts);
     }
     page = ctx.pages()[0] || (await ctx.newPage());
-    await page.addInitScript(() => {
+    await page.addInitScript((mute) => {
       try {
         Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
       } catch {}
-    }).catch(() => {});
+      if (mute) {
+        // 免打扰：网页想弹的系统通知直接变成「已拒绝」，不往任务栏发
+        try {
+          class NoNotification {
+            static get permission() { return 'denied'; }
+            static requestPermission() { return Promise.resolve('denied'); }
+            constructor() {}
+            close() {}
+          }
+          Object.defineProperty(window, 'Notification', { configurable: true, get: () => NoNotification });
+        } catch {}
+      }
+    }, muteNotify).catch(() => {});
     page.setDefaultTimeout(20000);
     ctx.on('close', () => {
       ctx = null; page = null; current = null;
@@ -107,7 +128,7 @@ async function launch() {
       screencastOn = false; screencastHandler = null;
       log('浏览器已关闭');
       // 非主动关闭（崩溃等）时自动拉起，避免大屏一直黑屏
-      if (!intentionalClose) {
+      if (!intentionalClose && !paused) {
         log('浏览器意外关闭，3 秒后自动重开');
         setTimeout(() => {
           if (!ctx && !launching) {
@@ -129,6 +150,7 @@ async function launch() {
 }
 
 async function ensurePage() {
+  if (paused) throw new Error('抖音后台已关闭，点「重新打开抖音」才会再启动');
   await launch();
   if (!page || page.isClosed()) {
     page = ctx.pages()[0] || (await ctx.newPage());
@@ -391,6 +413,47 @@ async function setWindowVisible(show) {
     return { ok: false, reason: e.message };
   }
 }
+// 拒绝抖音的网页通知权限（已在运行的页面立即生效，不用重启）
+async function denyNotifications() {
+  const p = page && !page.isClosed() ? page : null;
+  if (!p) return false;
+  try {
+    const s = await cdpFor(p);
+    if (!s) return false;
+    await s.send('Browser.setPermission', {
+      permission: { name: 'notifications' },
+      setting: 'denied',
+      origin: 'https://www.douyin.com',
+    }).catch(() => {});
+    return true;
+  } catch {
+    return false;
+  }
+}
+// 免打扰开关：关掉抖音一直往任务栏弹的通知/媒体浮层。
+// 启动参数和通知权限都是浏览器级别的，改完必须把浏览器重开一次才彻底生效。
+async function setMuteNotify(on) {
+  const want = !!on;
+  const st = await loadState();
+  const changed = !!st.muteNotify !== want;
+  if (changed) {
+    st.muteNotify = want;
+    await saveState(st);
+  }
+  muteNotify = want;
+  let restarted = false;
+  if (changed && ctx) {
+    await closeBrowser();
+    await sleep(500);
+  }
+  if (!ctx) {
+    await launch();
+    restarted = true;
+    await openHome().catch(() => {});
+  }
+  await denyNotifications();
+  return { ok: true, muted: muteNotify, restarted };
+}
 async function captureJpeg(p, quality, scale) {
   const box = await playerBox(p);
   const s = await cdpFor(p);
@@ -515,7 +578,6 @@ async function liveShot(p) {
 // 只播放画面里可见面积最大的当前视频；其余预加载/已划走视频全部暂停静音
 async function ensurePlaying(p) {
   try {
-    await p.bringToFront().catch(() => {});
     return await p.evaluate(async () => {
       const videos = [...document.querySelectorAll('video')];
       let v = null;
@@ -820,6 +882,21 @@ async function openCommentPanel(p, isRetry = false) {
     return openCommentPanel(p, true);
   }
   return opened;
+}
+
+// 发评论失败时强制重开评论区：面板可能已经卡住/失焦，关掉再开一次
+// 用评论图标关，不要用 Escape —— Escape 会把整个视频弹窗一起关掉
+async function reopenCommentPanel(p) {
+  try {
+    if (await commentPanelOpen(p)) {
+      const icon = p.locator('[data-e2e="feed-comment-icon"]').first();
+      if (await icon.isVisible({ timeout: 1200 })) {
+        await icon.click({ timeout: 3000 });
+        await sleep(900);
+      }
+    }
+  } catch {}
+  return await openCommentPanel(p);
 }
 
 const readEditor = (e) =>
@@ -1178,11 +1255,20 @@ async function handle(req, res) {
           : null,
         dailyCount,
         dailyLimit: MAX_DAILY_COMMENTS,
+        muted: muteNotify,
+        paused,
         lastError,
       });
     }
 
     if (path === '/api/login' || path === '/api/open') {
+      // 手动打开抖音：解除「关掉后台」状态
+      if (paused) {
+        paused = false;
+        const st0 = await loadState();
+        st0.paused = false;
+        await saveState(st0);
+      }
       const p = await openHome();
       if (path === '/api/login') {
         if (!/douyin\.com/.test(p.url())) {
@@ -1256,6 +1342,9 @@ async function handle(req, res) {
 
     if (path === '/api/next') {
       const body = await readBody(req);
+      if (paused) {
+        return json(res, 200, { ok: false, paused: true, reason: '抖音后台已关闭，点「重新打开抖音」再开始' });
+      }
       const requestSeq = ++nextRequestSeq;
       const previous = nextTask;
       const expired = () => requestSeq !== nextRequestSeq;
@@ -1272,7 +1361,6 @@ async function handle(req, res) {
         }
         let p = await openHome();
         if (expired()) return stale();
-        await p.bringToFront().catch(() => {});
         const loginWall = await loginWallVisible(p);
         if (expired()) return stale();
         if (loginWall) {
@@ -1400,15 +1488,34 @@ async function handle(req, res) {
       if (!lim.ok) return json(res, 200, { ok: false, reason: lim.reason });
 
       const p = await ensurePage();
-      await p.bringToFront().catch(() => {});
       // 评论是给「快照里那条视频」写的；打开评论区前先确认页面还停在同一条
       if (expectKey && (await videoKey(p)) !== expectKey) {
         return json(res, 200, { ok: false, stale: true, reason: '视频已经切换，本条评论作废' });
       }
       if (!(await openCommentPanel(p))) {
-        return json(res, 200, { ok: false, reason: '评论区打不开（可能当前没在播放视频）' });
+        // 打不开就等一会儿再试一次，别直接判失败
+        await sleep(1200);
+        if (!(await openCommentPanel(p))) {
+          return json(res, 200, { ok: false, reason: '评论区打不开（可能当前没在播放视频）' });
+        }
       }
-      const r = await typeComment(p, text, expectKey);
+      let r = await typeComment(p, text, expectKey);
+      // 发送失败：重开评论区再试一次（面板失焦/卡住时重开往往就好了）
+      if (!r.ok && !r.stale) {
+        const reopened = await reopenCommentPanel(p);
+        if (reopened) {
+          // 重开面板这段时间视频可能又划走了，先确认还是同一条
+          if (expectKey && (await videoKey(p)) !== expectKey) {
+            return json(res, 200, { ok: false, stale: true, reason: '视频已经切换，本条评论作废' });
+          }
+          const r2 = await typeComment(p, text, expectKey);
+          if (!r2.ok) r2.reason = `${r2.reason}（已重开评论区重试）`;
+          r2.retried = true;
+          r = r2;
+        } else {
+          r.reason = `${r.reason}（评论区重开失败）`;
+        }
+      }
       if (!r.ok) return json(res, 200, r);
 
       const now = today();
@@ -1756,9 +1863,24 @@ async function handle(req, res) {
       return json(res, 200, r);
     }
 
+    if (path === '/api/mute-notify') {
+      const b = req.method === 'POST' ? await readBody(req) : {};
+      const off = b.on === false || b.on === 'false' || b.on === 0 || b.on === '0';
+      const r = await setMuteNotify(!off);
+      return json(res, 200, r);
+    }
+
     if (path === '/api/close') {
-      await closeBrowser();
-      return json(res, 200, { ok: true });
+      // 大屏点「关掉抖音后台」：关掉浏览器并记住，之后不再自动拉起
+      paused = true;
+      const st = await loadState();
+      st.paused = true;
+      await saveState(st);
+      await stopScreencast().catch(() => {});
+      if (ctx) { try { await ctx.close(); } catch {} }
+      ctx = null; page = null; current = null;
+      cdpSession = null; liveBuf = null;
+      return json(res, 200, { ok: true, paused: true });
     }
 
     if (path === '/api/web/search') {
@@ -1821,6 +1943,9 @@ async function handle(req, res) {
 }
 
 const server = http.createServer(handle);
+const bootState = await loadState();
+paused = !!bootState.paused;
+muteNotify = !!bootState.muteNotify;
 server.listen(PORT, '127.0.0.1', () => {
   log(`已启动 http://127.0.0.1:${PORT}`);
   log(`浏览器配置目录: ${PROFILE}`);
